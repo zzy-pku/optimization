@@ -228,7 +228,7 @@ def participation(h, subset, vectors):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--module', choices=['M1','M2'], default='M1')
+    p.add_argument('--module', choices=['M1','M2','M1+M2'], default='M1+M2')
     p.add_argument('--check-probes',type=int,default=2,help='independent decomposition checks for M2')
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--output', required=True)
@@ -274,7 +274,7 @@ def main():
     batches = [{k:v[indices[i:i+args.microbatch]].to(device) for k,v in batch.items()} for i in range(0,len(indices),args.microbatch)]
     # All-ignored local slices contribute exactly zero and need no graph.
     batches = [b for b in batches if (b['labels'] != -100).any()]
-    if args.module == 'M2':
+    if args.module in ('M2','M1+M2'):
         from .components import Decomposition
         h = Decomposition(model,batches,count,state['layer'])
     else:
@@ -308,10 +308,12 @@ def main():
             spec['training_gradient_precision'] = state['gradient_precision']
             spec['gradient_comparison_note'] = 'FP32/64 curvature versus saved raw training gradient; BF16 differences are reported'
         try:
-            if args.module == 'M2':
+            if args.module in ('M2','M1+M2'):
                 from .m2 import run_m2
                 spec['anchor'] = 'block_output'
-                spec['module'] = 'M2'
+                spec['module'] = args.module
+                spec['modules'] = ['M1','M2'] if args.module=='M1+M2' else ['M2']
+                spec['shared_H'] = True
                 spec['anchor_path'] = f'blocks.{state["layer"]}.output_after_ffn_residual'
                 stats = run_m2(args,state,h,gradient,output,spec)
             else:

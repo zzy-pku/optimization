@@ -22,3 +22,16 @@ torchrun --standalone --nproc-per-node=2 -m ougd.measure --module M2 \
 ```
 
 当前没有 GPU，尚未执行 CUDA/NCCL、多节点、正式 S1/S2 或跨 seed 科学复现；这些 smoke 结果不代表正式实验完成。A 可能不定，此实现没有将它当作标准 PSD GGN。
+
+## M1+M2 联合运行回归
+
+默认入口改为 `--module M1+M2`，保留显式 M1/M2 单项模式。
+
+- unittest 共 14 项通过；新增调度测试验证 H/A/R 各运行一次、只对 H 启用 M1 cross 消融，并正确保留显式预算裁剪。
+- 同一 tiny FP64 模型检查点上，ST 单进程及 TB 两进程（各 rank 有效 token 数为 3/2）均完成联合测量；TB 不传 module 参数，验证默认值，ST 显式传 `--module M1+M2`。
+- 每个 scope 完成 H/A/R 各十五组 LA/SA、各六组 cross SVD、H 的十二个 cross 消融谱（六组×LA/SA）、M2 归因和子空间比较；coverage 为 262 complete、3 pilot、2 skipped_budget，无失败。
+- k=1、4 probes、投影 row/column rank=1。pilot 为低 probe 范数；两项 skipped_budget 是不适用于完整 M1 观测的 A/R cross 消融，H cross 消融已执行。
+- 逐项确认 H/A/R 的 checkpoint/batch hash、layer、scope、precision 一致；投影基逐元素相同；M2 的固定 H 方向引用指向唯一的 H/vectors 文件。
+- 两个 scope 的联合结果各成功导出 23 个 Parquet 文件。输出位于 git 忽略的 runs/joint/{ST,TB}。
+
+仍是 CPU/Gloo smoke，未增加 CUDA/NCCL、多节点或正式科学实验的验收声明。

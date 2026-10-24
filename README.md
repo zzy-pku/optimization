@@ -58,7 +58,7 @@ torchrun --standalone --nproc-per-node=8 -m ougd.train \
 
 `--measure-steps` 控制保存点，默认包含协议候选点和最终更新前一步；如需 T1 全程采样，传入包含每 250–500 steps 的列表。观测采用离线重放，**不会在训练循环里隐式插入昂贵谱测量**。
 
-## M1 测量
+## 测量入口
 
 ```bash
 # 双口径分别运行，output 必须为空，防止不同算子混写。
@@ -80,7 +80,7 @@ T1 使用固定 FP batch（保存含 input_ids/labels 的 torch 字典）和 `--
 
 `operator_meta.json` 保存 scope、完整 batch/checkpoint hash、参数形状与 row-major O/U/G/D flatten 顺序、环境和成本。TB 记录 FP32/64 CE 重放梯度与训练原始梯度的差异，预设容差为 FP32 `1e-5` / BF16 `0.05`，超阈值会标记 `gradient_replay_passed=false`，必须调查后才可用于正式结论。BF16 训练梯度与 FP32 CE 导数不是逐 bit 相同。
 
-`vectors/*.npz` 保存 eigenvectors / cross 左右向量及 residual；不生成完整 Hessian。范数少于 16 probes 标作 pilot，sqrt estimator 有偏，coupling 分母近零记 null。谱即使输出了数值也需检查 `converged` 和 residual；近简并需比较整个 subspace，不能仅凭单方向解释。投影稳定性只针对所选随机基，结构结论不能外推完整参数空间。重复 seed 稳定性由独立运行对照，当前不自动执行复核或冻结研究结论。
+单独 M1 模式的 `vectors/*.npz`（联合模式在 `H/vectors/` 等子目录）保存 eigenvectors / cross 左右向量及 residual；不生成完整 Hessian。范数少于 16 probes 标作 pilot，sqrt estimator 有偏，coupling 分母近零记 null。谱即使输出了数值也需检查 `converged` 和 residual；近简并需比较整个 subspace，不能仅凭单方向解释。投影稳定性只针对所选随机基，结构结论不能外推完整参数空间。重复 seed 稳定性由独立运行对照，当前不自动执行复核或冻结研究结论。
 
 ## 多机 / Slurm
 
@@ -133,7 +133,7 @@ python -m ougd.report /shared/results/step300/M2_TB
 
 对当前 SwiGLU block-output anchor，z 对 U、D 分别仿射，所以 `R_UU=R_DD=0`。这两块使用解析零谱，保存的 canonical vectors 仅是任意零空间基；相关 sharp-space overlap/leakage 的不可识别比较记为 null，不据此解释方向。
 
-`--sets`、`--k`、`--probes`、`--projection-rank` 和 `--norms-only` 同样适用。预算裁剪在 coverage 中保留。M2 不重复 M1 的逐 cross 消融；M4 的成分插值/因子消融仍未实现。R matvec 通常需要 H 和 A 两条路径，M2 的计算量显著高于 M1；当前仍重放真实 TB，不缓存完整二阶图，也不以小 probe batch 冒充 TB。
+`--sets`、`--k`、`--probes`、`--projection-rank` 和 `--norms-only` 同样适用。预算裁剪在 coverage 中保留。单独 `--module M2` 不重复 M1 的逐 cross 消融；联合模式会在 H 上完整执行该消融；M4 的成分插值/因子消融仍未实现。R matvec 通常需要 H 和 A 两条路径，M2 的计算量显著高于 M1；当前仍重放真实 TB，不缓存完整二阶图，也不以小 probe batch 冒充 TB。
 
 额外分布式回归：
 
@@ -142,3 +142,25 @@ torchrun --standalone --nproc-per-node=2 -m tests.distributed_components
 ```
 
 这项测试逐一核对 TB/ST 下的 H、A、R、R_direct 与串行计算，包括 ST 空数据 worker。CUDA/NCCL 和多节点仍需要目标 GPU 集群实测。
+
+
+## 同一次实验同时观测 M1 与 M2（默认模式）
+
+现在 `ougd.measure` 默认使用 `--module M1+M2`。一个测量任务在同一更新前 checkpoint、同一层、同一 ST/TB/FP scope 和同一数据 mask 上完成两方面观测：
+
+```bash
+torchrun --standalone --nproc-per-node=8 -m ougd.measure --module M1+M2 \
+  --checkpoint /shared/runs/s2/pre_step_000300.pt --scope TB \
+  --output /shared/results/step300/M1_M2_TB --k 10 --probes 16
+python -m ougd.report /shared/results/step300/M1_M2_TB
+```
+
+- `H/` 同时提供 M1 和 M2 共用的 H 观测：十块统计、self/cross/十五 joint 谱、self-only、六组 cross 成对置零、参与比例及结构投影。**H 的每个谱只求解一次**，M2 归因直接读取这些 H 特征向量。
+- `A/`、`R/` 提供 M2 两组件自身的谱和统计；根目录保存 A/R 对齐、固定 H 方向归因、子空间比较和统一 coverage。
+- H/A/R 共享 checkpoint/batch hash、scope、flatten 顺序、随机 probes 及投影基。元数据的 `modules` 和 `shared_H` 明确记录共用关系。
+- 一个任务中按计算依赖先获得 H/A/R 的谱，再计算归因；不要求不同模块并发抢占 GPU。多卡并行发生在每次算子的 TB 数据重放上。
+- `--no-ablation` 仅在明确裁剪预算时跳过 H cross 消融，coverage 中会标记；A/R 不重复 M1 消融。`--norms-only` 仍只产生 proxy，不能当作完整联合观测。
+
+ST 与 TB 各对应一个固定算子，分别使用上述命令的 `--scope ST --token ...` 和 `--scope TB`，放入同一实验目录的不同 scope 子目录。无需分别启动 M1 和 M2 两次。
+
+仍可显式传 `--module M1` 或 `--module M2` 进行单项调试。`main` 的 version 1 基线不受此默认值变更影响；新模式位于 `m2` 分支。

@@ -9,7 +9,7 @@ def export(directory):
     import pyarrow.parquet as pq
     p = Path(directory)
     meta = json.loads((p/'operator_meta.json').read_text())
-    if meta.get('module') == 'M2' and (p/'H').is_dir():
+    if meta.get('module') in ('M2','M1+M2') and (p/'H').is_dir():
         for operator in ('H','A','R'):
             export(p/operator)
         export_m2(p,meta)

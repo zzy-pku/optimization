@@ -180,13 +180,13 @@ def run_m2(args,state,backend,gradient,output,metadata):
     norms,paired=shared_statistics(backend,args.probes,args.seed)
     write(output/'component_alignment.json',paired)
     coverage=[dict(metric='M2_decomposition',status='complete')]
-    childargs=copy.copy(args)
-    # M2 compares independent spectra; M1 cross ablations are not repeated per component.
-    childargs.no_ablation=True
     for name in ('H','A','R'):
+        childargs=component_options(args,name)
         folder=output/name; folder.mkdir(); (folder/'vectors').mkdir()
         view=backend.view(name)
         component_meta={**metadata,'operator':name,'anchor':'block_output',
+                        'modules':metadata.get('modules',['M2']) if name=='H' else ['M2'],
+                        'args':vars(childargs),
                         'definition':{'H':'original CE Hessian','A':'J^T B J; possibly indefinite',
                                       'R':'H-A; checked independently against Hessian(<stopgrad(q),z>)'}[name]}
         try:
@@ -194,7 +194,7 @@ def run_m2(args,state,backend,gradient,output,metadata):
             component_meta.update(stats)
         finally:
             write(folder/'operator_meta.json',component_meta)
-        coverage.extend({**row,'operator':name} for row in json.loads((folder/'coverage.json').read_text()))
+        coverage.extend({**row,'operator':name,'modules':component_meta['modules']} for row in json.loads((folder/'coverage.json').read_text()))
     if not args.norms_only:
         subsets=[tuple(s) for s in args.sets.split(',')] if args.sets else [s for n in range(1,5) for s in combinations(BLOCKS,n)]
         attr,cross,spaces=compare(output,backend,subsets)
@@ -214,6 +214,15 @@ def run_m2(args,state,backend,gradient,output,metadata):
                 eig_end=row.get('eig_end'),status='complete' if row['source_spectra_converged'] else 'failed_convergence'))
     else:
         coverage.append(dict(metric='M2_attribution_and_subspaces',status='pending'))
+    for row in coverage:
+        row.setdefault('modules',['M2'])
     write(output/'coverage.json',coverage)
     return dict(seconds=time.perf_counter()-start,matvecs=backend.calls,
                 peak_memory_bytes=torch.cuda.max_memory_allocated() if backend.device.type=='cuda' else None)
+
+
+def component_options(args, operator):
+    """Run H once for both modules; only H receives the M1 cross ablations."""
+    options=copy.copy(args)
+    options.no_ablation = not (args.module=='M1+M2' and operator=='H' and not args.no_ablation)
+    return options
