@@ -1,6 +1,6 @@
-# Transformer O/U/G/D Hessian 实验（M1）
+# Transformer O/U/G/D Hessian 实验（M1 / M2）
 
-本仓库依据 [实验协议 v2.0](docs/protocol_v2.md) 实现训练与 **M1**；M2–M4 不在当前实现范围。层号在命令行中从 **0** 开始，因此协议 Layer 6 使用 `--layer 5`。
+本仓库依据 [实验协议 v2.0](docs/protocol_v2.md) 实现训练与 **M1、M2**；M3/M4 观测不在当前实现范围。层号在命令行中从 **0** 开始，因此协议 Layer 6 使用 `--layer 5`。
 
 ## 已实现
 
@@ -106,3 +106,39 @@ torchrun --standalone --nproc-per-node=2 -m tests.distributed_check
 数值测试使用 tiny FP64 Transformer 的小坐标 dense 真值，验证十五种子集 LA/SA、六组 cross SVD、signed 回和、Hessian 对称性、有效 token 加权及 ST→TB 聚合。此为 **M1 的 S0 子集**，不宣称完成协议中 M2–M4 的 S0 验收。
 
 开发机为 CPU-only。已实际跑通双进程 DDP 训练、ST/TB 各十五种 joint、self-only/六组消融和投影。这里只证明实现路径和数值回归；**未运行 GPU/NCCL、多节点、FineWeb 下载或 S1/S2 正式训练**。正式运行前应使用目标 CUDA 环境、小规模配置和真实 context/batch 对 HVP 显存/耗时、BF16 梯度重放及通信进行 pilot，不将 smoke 性能外推到 100M 模型。
+
+
+## M2：activation-anchor A/R 分解
+
+M1 基线已保存在 `main` 的 `3449b51`（commit message: `version 1`）；M2 在独立 `m2` 分支开发。
+
+```bash
+torchrun --standalone --nproc-per-node=8 -m ougd.measure --module M2 \
+  --checkpoint /shared/runs/s2/pre_step_000300.pt --scope TB \
+  --output /shared/results/step300/M2_TB --k 10 --probes 16
+# ST 使用相同 checkpoint，改为 --scope ST --token 0:100，并更换 output。
+python -m ougd.report /shared/results/step300/M2_TB
+```
+
+锚点是所选 `blocks[layer]` 完成 FFN residual 相加后的全部 hidden states。完整前缀和后续网络均参与计算。`A = J^T B J` 使用 forward AD JVP、激活 BVP 和参数 VJP；`R = H-A`。A 是 activation-curvature propagation term，**可能不定，不是 PSD logits GGN**。每次 M2 运行先用独立 `Hessian(<stopgrad(q),z>)` 核验 residual，再开始观测；独立核验不通过时停止并留下失败记录。
+
+输出内容：
+
+- `H/`、`A/`、`R/`：各自十块 norm/SE、四 self、六 cross SVD、十五 joint 的 LA/SA、参与比例、signed block terms 及同一 seed 下的行/列投影。所有组件共享随机 probes 和投影基。
+- `component_alignment.json`：A/R 内积、cosine、A/H 与 R/H norm ratio、配对 Frobenius 回和误差；各组件 cross energy 在子目录。
+- `H_direction_contributions.json`：**固定 H 的原始 eigenvector** 后的 q^T A q、q^T R q、20 个有符号块项与回和误差。不将 A/R 排名相同的 eigenvalues 相加。
+- `H_cross_contributions.json`：固定 H 的 singular triple，保存 u^T A v、u^T R v 及回和误差。
+- `component_subspaces.json`：H/A/R 相同维数空间的 principal angles/overlap，以及 R→A、A→R 的绝对/相对 leakage 和谱间隔；cross 左右空间分别比较。
+- `decomposition_checks.json` 和 `coverage.json`：独立 residual、对称性、数值容差及完成/未收敛/未测状态。独立核验默认 FP64 1e-9、FP32 1e-4，未根据测量结果放宽。
+
+对当前 SwiGLU block-output anchor，z 对 U、D 分别仿射，所以 `R_UU=R_DD=0`。这两块使用解析零谱，保存的 canonical vectors 仅是任意零空间基；相关 sharp-space overlap/leakage 的不可识别比较记为 null，不据此解释方向。
+
+`--sets`、`--k`、`--probes`、`--projection-rank` 和 `--norms-only` 同样适用。预算裁剪在 coverage 中保留。M2 不重复 M1 的逐 cross 消融；M4 的成分插值/因子消融仍未实现。R matvec 通常需要 H 和 A 两条路径，M2 的计算量显著高于 M1；当前仍重放真实 TB，不缓存完整二阶图，也不以小 probe batch 冒充 TB。
+
+额外分布式回归：
+
+```bash
+torchrun --standalone --nproc-per-node=2 -m tests.distributed_components
+```
+
+这项测试逐一核对 TB/ST 下的 H、A、R、R_direct 与串行计算，包括 ST 空数据 worker。CUDA/NCCL 和多节点仍需要目标 GPU 集群实测。

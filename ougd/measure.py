@@ -1,4 +1,4 @@
-"""M1 driver. Rank 0 owns every stochastic probe and Lanczos iteration."""
+"""M1/M2 driver. Rank 0 owns every stochastic probe and Lanczos iteration."""
 import argparse
 from dataclasses import asdict
 import hashlib
@@ -11,7 +11,7 @@ import torch
 from . import distributed as dd
 from .hessian import Hessian
 from .model import Transformer, ModelConfig, BLOCKS
-from .solvers import spectrum, cross_svd, overlap
+from .solvers import spectrum, cross_svd, overlap, zero_spectrum
 
 
 def jsonable(x):
@@ -123,10 +123,11 @@ def contributions(h, subset, spec, gradient, update):
             signed_terms=terms, sum_error=float(sum(terms.values())-eig), block_direction_alignment=align))
     return records
 
-def run(args, state, h, gradient, output):
+def run(args, state, h, gradient, output, norms=None):
     start = time.perf_counter()
+    operator = getattr(h, 'operator', 'H')
     dtype = np.float64 if h.dtype == torch.float64 else np.float32
-    norms = norm_statistics(h, args.probes, args.seed)
+    norms = norms if norms is not None else norm_statistics(h, args.probes, args.seed)
     write(output/'norms_and_coupling.json', norms)
     directions = {}
     for name, direction in [('gradient', gradient), ('update', np.concatenate([state['updates'][k].flatten().numpy() for k in BLOCKS]))]:
@@ -144,11 +145,11 @@ def run(args, state, h, gradient, output):
                 directions[name][i+j] = float(unit[i]@out[h.slices[i]]) if unit[i] is not None else None
     write(output/'directional_curvature.json', directions)
     if args.norms_only:
-        write(output/'coverage.json', [dict(metric='M1_norms', status='pilot', scope=args.scope),
-            dict(metric='M1_spectra_and_structure',status='pending')])
+        write(output/'coverage.json', [dict(metric=operator+'_norms', status='pilot', scope=args.scope),
+            dict(metric=operator+'_spectra_and_structure',status='pending')])
         return dict(seconds=time.perf_counter()-start,matvecs=h.calls)
     update = np.concatenate([state['updates'][k].flatten().numpy() for k in BLOCKS])
-    coverage, spectra, summary = [dict(metric='M1_norms',status='pilot' if args.probes < 16 else 'complete')], {}, {}
+    coverage, spectra, summary = [dict(metric=operator+'_norms',status='pilot' if args.probes < 16 else 'complete')], {}, {}
     subsets = [tuple(s) for s in args.sets.split(',')] if args.sets else [s for n in range(1,5) for s in combinations(BLOCKS,n)]
     def save_spec(name, spec):
         arrays = {k: v for k,v in spec.items() if isinstance(v, np.ndarray)}
@@ -162,19 +163,19 @@ def run(args, state, h, gradient, output):
         n = sum(h.sizes[i] for i in subset)
         summary[key] = {}
         for end in ('LA','SA'):
-            spec = spectrum(lambda v: h.joint(subset,v), n, args.k, end,args.tol,args.maxiter,args.seed,dtype)
+            spec = zero_spectrum(n,args.k,dtype) if getattr(h,'is_zero',lambda *_:False)(subset) else spectrum(lambda v: h.joint(subset,v), n, args.k, end,args.tol,args.maxiter,args.seed,dtype)
             spectra[key,end] = spec
-            save_spec(f'H_{key}_{end}',spec)
+            save_spec(f'{operator}_{key}_{end}',spec)
             summary[key][end] = contributions(h,subset,spec,gradient,update)
             if len(subset) > 1:
-                diag = spectrum(lambda v: h.joint(subset,v,self_only=True),n,args.k,end,args.tol,args.maxiter,args.seed,dtype)
+                diag = zero_spectrum(n,args.k,dtype) if getattr(h,'is_zero',lambda *_:False)(subset,True) else spectrum(lambda v: h.joint(subset,v,self_only=True),n,args.k,end,args.tol,args.maxiter,args.seed,dtype)
                 save_spec(f'self_only_{key}_{end}',diag)
-                summary[key][end+'_self_only_overlap'] = overlap(spec['vectors'],diag['vectors'])
+                summary[key][end+'_self_only_overlap'] = dict(overlap=None,angles=None,reason='structurally zero, fully degenerate spectrum') if spec.get('structural_zero') or diag.get('structural_zero') else overlap(spec['vectors'],diag['vectors'])
                 summary[key][end+'_self_only_participation'] = participation(h, subset, diag['vectors'])
     cross_rows = []
     for i,j in combinations(BLOCKS,2):
         s = cross_svd(lambda v:h.block(i,j,v),lambda v:h.block(j,i,v),h.sizes[i],h.sizes[j],args.k,args.tol,args.maxiter,args.seed,dtype)
-        save_spec(f'H_{i+j}_SVD',s)
+        save_spec(f'{operator}_{i+j}_SVD',s)
         row = dict(block=i+j, captured_frobenius_energy=float(np.sum(s['values']**2)/norms['blocks'][i+j]['norm2']) if norms['blocks'][i+j]['norm2'] else None,
                    energy_denominator='stochastic Frobenius estimate; ratio may exceed 1')
         for side,k in [('left',i),('right',j)]:
@@ -210,7 +211,7 @@ def run(args, state, h, gradient, output):
         coverage.append(dict(metric='projected_structure',status='complete',measurement='projected'))
     for n in range(1,5):
         for s in combinations(BLOCKS,n):
-            if s not in subsets: coverage.append(dict(metric='H_'+''.join(s),status='pending'))
+            if s not in subsets: coverage.append(dict(metric=operator+'_'+''.join(s),status='pending'))
     write(output/'contributions.json',summary)
     write(output/'cross_subspaces.json',cross_rows)
     write(output/'interlacing.json',interlacing)
@@ -227,6 +228,8 @@ def participation(h, subset, vectors):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument('--module', choices=['M1','M2'], default='M1')
+    p.add_argument('--check-probes',type=int,default=2,help='independent decomposition checks for M2')
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--scope', choices=['TB','ST','FP'],default='TB')
@@ -271,7 +274,11 @@ def main():
     batches = [{k:v[indices[i:i+args.microbatch]].to(device) for k,v in batch.items()} for i in range(0,len(indices),args.microbatch)]
     # All-ignored local slices contribute exactly zero and need no graph.
     batches = [b for b in batches if (b['labels'] != -100).any()]
-    h = Hessian(model,batches,count,state['layer'])
+    if args.module == 'M2':
+        from .components import Decomposition
+        h = Decomposition(model,batches,count,state['layer'])
+    else:
+        h = Hessian(model,batches,count,state['layer'])
     gradient = h.gradient()
     if rank:
         h.serve()
@@ -301,7 +308,14 @@ def main():
             spec['training_gradient_precision'] = state['gradient_precision']
             spec['gradient_comparison_note'] = 'FP32/64 curvature versus saved raw training gradient; BF16 differences are reported'
         try:
-            stats = run(args,state,h,gradient,output)
+            if args.module == 'M2':
+                from .m2 import run_m2
+                spec['anchor'] = 'block_output'
+                spec['module'] = 'M2'
+                spec['anchor_path'] = f'blocks.{state["layer"]}.output_after_ffn_residual'
+                stats = run_m2(args,state,h,gradient,output,spec)
+            else:
+                stats = run(args,state,h,gradient,output)
             spec.update(stats)
             spec['gpu_seconds'] = stats['seconds']*world if device.type == 'cuda' else 0.
         finally:

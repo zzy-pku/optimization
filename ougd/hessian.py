@@ -45,14 +45,22 @@ class Hessian:
             result += torch.cat([v.detach().flatten() for v in g])
         return sum_(result).cpu().numpy()
 
+    def local_component(self, vector, code):
+        if code != 1:
+            raise ValueError("unknown operator")
+        return self.local(vector)
+
     def __call__(self, vector):
+        return self.request(vector, 1)
+
+    def request(self, vector, code):
         """Only rank 0 calls this; other ranks serve()."""
         v = torch.as_tensor(np.array(vector, copy=True), device=self.device, dtype=self.dtype)
         if dist.is_initialized():
-            dist.broadcast(torch.tensor(1, device=self.device), 0)
+            dist.broadcast(torch.tensor(code, device=self.device), 0)
             dist.broadcast(v, 0)
         self.calls += 1
-        return self.local(v).cpu().numpy()
+        return self.local_component(v, code).cpu().numpy()
 
     def serve(self):
         while True:
@@ -62,7 +70,7 @@ class Hessian:
                 return
             v = torch.empty(self.n, device=self.device, dtype=self.dtype)
             dist.broadcast(v, 0)
-            self.local(v)
+            self.local_component(v, command.item())
 
     def stop(self):
         if dist.is_initialized():

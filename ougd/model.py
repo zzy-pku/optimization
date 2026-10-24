@@ -76,6 +76,7 @@ class Block(nn.Module):
         return x + self.D(F.silu(self.G(h)) * self.U(h))
 
 class Transformer(nn.Module):
+    anchor_affine_blocks = ('U', 'D')
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -89,13 +90,21 @@ class Transformer(nn.Module):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, ids):
+    def forward(self, ids, anchor_layer=None):
         if ids.shape[1] > self.config.context:
             raise ValueError('sequence exceeds context')
         h = self.embedding(ids)
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             h = block(h)
+            if index == anchor_layer:
+                return h
         return F.linear(self.norm(h), self.embedding.weight)
+
+    def from_anchor(self, hidden, layer):
+        """Continue after block[layer], including all downstream blocks and output norm."""
+        for block in self.blocks[layer+1:]:
+            hidden = block(hidden)
+        return F.linear(self.norm(hidden), self.embedding.weight)
 
     def selected(self, layer):
         b = self.blocks[layer]
