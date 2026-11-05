@@ -10,8 +10,8 @@ from .model import BLOCKS
 CODES = {'H': 1, 'A': 2, 'R': 3, 'R_direct': 4}
 
 class Decomposition(Hessian):
-    def __init__(self, model, batches, total_tokens, layer):
-        super().__init__(model, batches, total_tokens, layer)
+    def __init__(self, model, batches, total_tokens, layer, blocks=None):
+        super().__init__(model, batches, total_tokens, layer, blocks=blocks)
         self.layer = layer
         names = {id(p): name for name, p in model.named_parameters()}
         self.names = [names[id(p)] for p in self.params.values()]

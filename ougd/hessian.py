@@ -3,12 +3,18 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from .distributed import sum_
-from .model import BLOCKS, ce_sum
+from .model import ce_sum
 
 class Hessian:
-    def __init__(self, model, batches, total_tokens, layer):
+    def __init__(self, model, batches, total_tokens, layer, blocks=None):
         self.model, self.batches, self.total_tokens = model, batches, total_tokens
-        self.params = model.selected(layer)
+        available = model.selected_seven(layer)
+        if blocks is None:
+            self.params = model.selected(layer)
+        else:
+            if not blocks or len(set(blocks)) != len(blocks) or any(k not in available for k in blocks):
+                raise ValueError('invalid parameter block order')
+            self.params = {k: available[k] for k in blocks}
         chosen = {id(p) for p in self.params.values()}
         for p in model.parameters():
             p.requires_grad_(id(p) in chosen)
@@ -32,7 +38,7 @@ class Hessian:
         for batch in self.batches:
             loss = ce_sum(self.model, batch) / self.total_tokens
             g = torch.autograd.grad(loss, pp, create_graph=True)
-            dot = sum((a * vector[self.slices[k]].reshape_as(a)).sum() for k, a in zip(BLOCKS, g))
+            dot = sum((a * vector[self.slices[k]].reshape_as(a)).sum() for k, a in zip(self.params, g))
             h = torch.autograd.grad(dot, pp)
             result += torch.cat([a.detach().flatten() for a in h])
         return sum_(result)

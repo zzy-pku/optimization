@@ -13,6 +13,10 @@ dependencies = ["torch>=2.4", "numpy>=1.24", "scipy>=1.11"]
 data = ["datasets>=3", "transformers>=4.45", "sentencepiece"]
 test = ["pytest>=8"]
 reports = ["pyarrow>=14"]
+plots = ["matplotlib>=3.7"]
 
 [tool.setuptools.packages.find]
 include = ["ougd*"]
+
+[tool.setuptools.package-data]
+"ougd.vendor" = ["LICENSE_*"]

@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 
 BLOCKS = ('O', 'U', 'G', 'D')
+SEVEN_BLOCKS = ('Q', 'K', 'V', 'O', 'U', 'G', 'D')
 
 @dataclass
 class ModelConfig:
@@ -109,6 +110,12 @@ class Transformer(nn.Module):
     def selected(self, layer):
         b = self.blocks[layer]
         return dict(zip(BLOCKS, (b.attn.O.weight, b.U.weight, b.G.weight, b.D.weight)))
+
+    def selected_seven(self, layer):
+        """Whole matrices inside one block; embedding and norm stay outside."""
+        b = self.blocks[layer]
+        return dict(zip(SEVEN_BLOCKS, (b.attn.q.weight, b.attn.k.weight,
+                    b.attn.v.weight, b.attn.O.weight, b.U.weight, b.G.weight, b.D.weight)))
 
 def ce_sum(model, batch):
     logits = model(batch['input_ids'])

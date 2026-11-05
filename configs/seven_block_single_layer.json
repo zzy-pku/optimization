@@ -1,0 +1,1 @@
+{"vocab_size": 16000, "dim": 288, "hidden_dim": 768, "layers": 1, "heads": 6, "kv_heads": 2, "context": 512}

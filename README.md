@@ -1,5 +1,7 @@
 # Transformer O/U/G/D Hessian 实验（M1 / M2）
 
+单层 Transformer 七块 Q/K/V/O/U/G/D 正端子空间覆盖与完整F范数实验，请参见[独立运行说明](docs/seven_block_positive.md)。
+
 本仓库依据 [实验协议 v2.0](docs/protocol_v2.md) 实现训练与 **M1、M2**；M3/M4 观测不在当前实现范围。层号在命令行中从 **0** 开始，因此协议 Layer 6 使用 `--layer 5`。
 
 ## 已实现

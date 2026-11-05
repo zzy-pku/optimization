@@ -16,6 +16,73 @@ from .data import TokenData, sha256, make_batches
 from .model import ModelConfig, Transformer, ce_sum
 
 
+def optimizer_settings(args):
+    settings = {'optimizer': args.optimizer, 'weight_decay': args.weight_decay}
+    if args.optimizer in ('adamw', 'adam', 'soap', 'muon'):
+        settings.update(beta1=args.beta1, beta2=args.beta2, eps=args.eps)
+    if args.optimizer == 'sgd':
+        settings.update(momentum=args.momentum, nesterov=args.nesterov)
+    if args.optimizer in ('muon', 'soap'):
+        settings.update(aux_lr=args.aux_lr, lr=args.lr)
+    if args.optimizer == 'muon':
+        settings.update(muon_momentum=args.muon_momentum)
+    if args.optimizer == 'soap':
+        settings.update(soap_precondition_frequency=args.soap_precondition_frequency,
+                        soap_max_precond_dim=args.soap_max_precond_dim)
+    return settings
+
+
+class PairedOptimizer:
+    """One stateful optimizer for block matrices and AdamW for remaining parameters."""
+    def __init__(self, primary, auxiliary):
+        self.primary, self.auxiliary = primary, auxiliary
+        self.param_groups = primary.param_groups + auxiliary.param_groups
+
+    def zero_grad(self, **kwargs):
+        self.primary.zero_grad(**kwargs); self.auxiliary.zero_grad(**kwargs)
+
+    def step(self):
+        self.primary.step(); self.auxiliary.step()
+
+    def state_dict(self):
+        return {'primary': self.primary.state_dict(), 'auxiliary': self.auxiliary.state_dict()}
+
+    def load_state_dict(self, state):
+        self.primary.load_state_dict(state['primary'])
+        self.auxiliary.load_state_dict(state['auxiliary'])
+        self.param_groups = self.primary.param_groups + self.auxiliary.param_groups
+
+
+def make_optimizer(model, args):
+    parameters = model.parameters()
+    if args.optimizer in ('muon', 'soap'):
+        named = list(model.named_parameters())
+        matrices = [p for name, p in named if name.startswith('blocks.') and p.ndim == 2]
+        other = [p for name, p in named if not (name.startswith('blocks.') and p.ndim == 2)]
+        if not matrices or not other:
+            raise ValueError('hybrid optimizer requires block matrices and auxiliary parameters')
+        if args.optimizer == 'muon':
+            from .vendor.muon import SingleDeviceMuon
+            primary = SingleDeviceMuon(matrices, lr=args.lr, momentum=args.muon_momentum,
+                                       weight_decay=args.weight_decay)
+        else:
+            from .vendor.soap import SOAP
+            primary = SOAP(matrices, lr=args.lr, betas=(args.beta1, args.beta2), eps=args.eps,
+                           weight_decay=args.weight_decay,
+                           precondition_frequency=args.soap_precondition_frequency,
+                           max_precond_dim=args.soap_max_precond_dim)
+        auxiliary = torch.optim.AdamW(other, lr=args.aux_lr, betas=(args.beta1, args.beta2),
+                                      eps=args.eps, weight_decay=args.weight_decay)
+        for group in auxiliary.param_groups: group['lr_scale'] = args.aux_lr / args.lr
+        return PairedOptimizer(primary, auxiliary)
+    if args.optimizer == 'sgd':
+        return torch.optim.SGD(parameters, lr=args.lr, momentum=args.momentum,
+                               nesterov=args.nesterov, weight_decay=args.weight_decay)
+    cls = torch.optim.AdamW if args.optimizer == 'adamw' else torch.optim.Adam
+    return cls(parameters, lr=args.lr, betas=(args.beta1, args.beta2),
+               eps=args.eps, weight_decay=args.weight_decay)
+
+
 def cpu_tree(value):
     if isinstance(value, torch.Tensor): return value.detach().cpu().clone()
     if isinstance(value, dict): return {k: cpu_tree(v) for k,v in value.items()}
@@ -33,7 +100,20 @@ def main():
     p.add_argument('--batch-tokens', type=int, default=131072)
     p.add_argument('--microbatch', type=int, default=1)
     p.add_argument('--layer', type=int, default=5, help='zero-based measurement layer')
+    p.add_argument('--measure-blocks', choices=['four', 'seven'], default='four',
+                   help='which block gradients and updates to save in pre-step checkpoints')
     p.add_argument('--lr', type=float, default=4e-4)
+    p.add_argument('--optimizer', choices=['adamw', 'adam', 'sgd', 'muon', 'soap'], default='adamw')
+    p.add_argument('--weight-decay', type=float, default=.1)
+    p.add_argument('--beta1', type=float, default=.9)
+    p.add_argument('--beta2', type=float, default=.95)
+    p.add_argument('--eps', type=float, default=1e-8)
+    p.add_argument('--momentum', type=float, default=.9)
+    p.add_argument('--nesterov', action='store_true')
+    p.add_argument('--aux-lr', type=float, default=4e-4, help='Muon/SOAP AdamW auxiliary peak LR')
+    p.add_argument('--muon-momentum', type=float, default=.95)
+    p.add_argument('--soap-precondition-frequency', type=int, default=10)
+    p.add_argument('--soap-max-precond-dim', type=int, default=1024)
     p.add_argument('--min-lr', type=float, default=4e-5)
     p.add_argument('--warmup', type=int, default=300)
     p.add_argument('--seed', type=int, default=17)
@@ -42,6 +122,16 @@ def main():
     p.add_argument('--save-every', type=int, default=250, help='post-update recovery checkpoint interval')
     p.add_argument('--resume')
     args = p.parse_args()
+    if args.nesterov and (args.optimizer != 'sgd' or args.momentum <= 0):
+        p.error('--nesterov requires SGD and positive momentum')
+    if (args.weight_decay < 0 or args.eps <= 0 or not (0 <= args.beta1 < 1 and 0 <= args.beta2 < 1)
+            or args.momentum < 0 or not 0 <= args.muon_momentum < 1 or args.lr <= 0 or args.aux_lr <= 0
+            or args.soap_precondition_frequency < 1 or args.soap_max_precond_dim < 1):
+        p.error('invalid optimizer hyperparameters')
+    if args.precision == 'fp32':
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision('highest')
     device, rank, world = dd.init()
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
@@ -56,7 +146,7 @@ def main():
     data = TokenData(args.data, c.context, c.vocab_size)
     data_hash = sha256(args.data)
     model = Transformer(c).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(.9, .95), weight_decay=.1)
+    optimizer = make_optimizer(model, args)
     start = 0
     if args.resume:
         state = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -64,6 +154,12 @@ def main():
             raise ValueError('resume dataset/model mismatch')
         if state['args']['batch_tokens'] != args.batch_tokens:
             raise ValueError('resume must preserve global batch size')
+        old = state['args']
+        defaults = dict(optimizer='adamw', weight_decay=.1, beta1=.9, beta2=.95,
+                        eps=1e-8, momentum=.9, nesterov=False)
+        current_settings = optimizer_settings(args)
+        if any(old.get(key, defaults.get(key)) != value for key, value in current_settings.items()):
+            raise ValueError('resume must preserve optimizer type and hyperparameters')
         model.load_state_dict(state['model'])
         optimizer.load_state_dict(state['optimizer'])
         start = state['step']
@@ -73,7 +169,7 @@ def main():
     wrapped = DDP(model, device_ids=[device.index] if device.type == 'cuda' else None) if world > 1 else model
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    selected = model.selected(args.layer)
+    selected = model.selected_seven(args.layer) if args.measure_blocks == 'seven' else model.selected(args.layer)
     measure_steps = {int(x) for x in args.measure_steps.split(',') if x}
     def cpu_state():
         return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -83,7 +179,10 @@ def main():
     if rank == 0:
         (output / 'run.json').write_text(json.dumps(dict(args=vars(args), model=asdict(c),
             parameters=sum(p.numel() for p in model.parameters()), world_size=world,
-            data_hash=data_hash, torch=torch.__version__), indent=2))
+            data_hash=data_hash, torch=torch.__version__,
+            optimizer_parameter_groups=({'primary': [n for n,p in model.named_parameters() if n.startswith('blocks.') and p.ndim == 2],
+              'adamw_auxiliary': [n for n,p in model.named_parameters() if not (n.startswith('blocks.') and p.ndim == 2)]}
+              if args.optimizer in ('muon', 'soap') else {'all': [n for n,p in model.named_parameters()]})), indent=2))
     for step in range(start, args.steps):
         begin = time.perf_counter()
         indices = [(step * sequences + j) % len(data.tokens) for j in range(sequences)]
@@ -94,7 +193,7 @@ def main():
             raise ValueError('empty effective batch')
         lr = args.lr * (step + 1) / args.warmup if step < args.warmup else args.min_lr + .5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * (step-args.warmup) / max(1, args.steps-args.warmup-1)))
         for g in optimizer.param_groups:
-            g['lr'] = lr
+            g['lr'] = lr * g.get('lr_scale', 1.)
         measured = step in measure_steps or step == args.steps-1
         before = {k: v.detach().clone() for k, v in selected.items()}
         pre = checkpoint(step) if measured and rank == 0 else None
@@ -118,6 +217,7 @@ def main():
                        batch={k: v.cpu() for k, v in data.batch(indices, 'cpu').items()},
                        batch_indices=indices, data_cursor=step * sequences,
                        raw_gradients=raw, updates={k: v.cpu() for k, v in updates.items()},
+                       parameter_order=list(selected),
                        gradient_precision=args.precision, valid_tokens=int(count))
             torch.save(pre, output / f'pre_step_{step:06d}.pt')
         train_loss = dd.sum_(loss_sum) / count
@@ -126,6 +226,8 @@ def main():
             tokens_per_second=int(count) / (time.perf_counter()-begin),
             blocks={k: dict(parameter_norm=float(v.detach().norm()), gradient_norm=float(raw[k].norm()),
                             update_norm=float(updates[k].norm())) for k, v in selected.items()})
+        if args.optimizer in ('muon', 'soap'):
+            metrics['aux_lr'] = optimizer.auxiliary.param_groups[0]['lr']
         if args.validation_data and (step % args.validation_every == 0 or step == args.steps-1):
             val = TokenData(args.validation_data, c.context, c.vocab_size)
             totals = torch.zeros(2, device=device, dtype=torch.float64)
