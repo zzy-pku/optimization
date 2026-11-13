@@ -6,10 +6,14 @@ from .distributed import sum_
 from .model import ce_sum
 
 class Hessian:
-    def __init__(self, model, batches, total_tokens, layer, blocks=None):
+    def __init__(self, model, batches, total_tokens, layer, blocks=None, parameters=None):
         self.model, self.batches, self.total_tokens = model, batches, total_tokens
         available = model.selected_seven(layer)
-        if blocks is None:
+        if parameters is not None:
+            if not parameters or len({id(p) for p in parameters.values()}) != len(parameters):
+                raise ValueError('parameters must be a nonempty mapping of distinct parameters')
+            self.params = dict(parameters)
+        elif blocks is None:
             self.params = model.selected(layer)
         else:
             if not blocks or len(set(blocks)) != len(blocks) or any(k not in available for k in blocks):
