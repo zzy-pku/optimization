@@ -17,6 +17,7 @@ class ModelConfig:
     kv_heads: int = 4
     context: int = 2048
     rope_theta: float = 10000.
+    tie_embeddings: bool = True
 
     def __post_init__(self):
         if self.dim % self.heads or self.heads % self.kv_heads or (self.dim // self.heads) % 2:
@@ -82,6 +83,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.dim)
+        self.lm_head = None if config.tie_embeddings else nn.Linear(config.dim, config.vocab_size, bias=False)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.layers)])
         self.norm = RMSNorm(config.dim)
         self.apply(self._init)
@@ -99,13 +101,13 @@ class Transformer(nn.Module):
             h = block(h)
             if index == anchor_layer:
                 return h
-        return F.linear(self.norm(h), self.embedding.weight)
+        return F.linear(self.norm(h), self.embedding.weight if self.lm_head is None else self.lm_head.weight)
 
     def from_anchor(self, hidden, layer):
         """Continue after block[layer], including all downstream blocks and output norm."""
         for block in self.blocks[layer+1:]:
             hidden = block(hidden)
-        return F.linear(self.norm(hidden), self.embedding.weight)
+        return F.linear(self.norm(hidden), self.embedding.weight if self.lm_head is None else self.lm_head.weight)
 
     def selected(self, layer):
         b = self.blocks[layer]
