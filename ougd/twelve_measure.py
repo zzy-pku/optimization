@@ -66,6 +66,7 @@ def main():
     p.add_argument('--probe-batch', required=True, help='fixed held-out batch .pt with input_ids and labels')
     p.add_argument('--output', required=True)
     p.add_argument('--phase', choices=['spectra', 'frobenius', 'coverage', 'all'], default='all')
+    p.add_argument('--spectrum-scopes', choices=['all','global','local'], default='all')
     p.add_argument('--single-layer', type=int, default=6, help='1-based')
     p.add_argument('--pair', type=int, nargs=2, default=[6, 7], help='two 1-based layers')
     p.add_argument('--k', type=int, default=20)
@@ -138,13 +139,20 @@ def main():
     if args.phase in ('all', 'spectra'):
         folder = out/'spectra'; folder.mkdir(exist_ok=True)
         for index, (name, selected) in enumerate(subsets.items()):
+            if args.spectrum_scopes == 'global' and name != 'global': continue
+            if args.spectrum_scopes == 'local' and name == 'global': continue
             path = folder/f'{name}.npz'; metadata = folder/f'{name}.json'
             if path.exists() and metadata.exists(): continue
             op = backend(selected); requested = args.k + 1
             log('spectrum', scope=name, index=index+1, total=len(subsets), dimension=op.n)
-            spec = positive_spectrum(op, op.n, requested, args.seed, args.solver_tol,
-                                     args.residual_tol, args.maxiter,
-                                     progress=lambda calls: log('spectrum_progress', scope=name, calls=calls))
+            if op.n * max(2*requested+1, 40) > 2**31-1:
+                from .large_spectrum import large_positive_spectrum
+                solver = large_positive_spectrum
+            else:
+                solver = positive_spectrum
+            spec = solver(op, op.n, requested, args.seed, args.solver_tol,
+                          args.residual_tol, args.maxiter,
+                          progress=lambda calls: log('spectrum_progress', scope=name, calls=calls))
             save_npz(path, values=spec['values'], vectors=spec['vectors'].astype(np.float32),
                      absolute_residual=spec['absolute_residual'], relative_residual=spec['relative_residual'])
             info = {k:v for k,v in spec.items() if k != 'vectors'}
