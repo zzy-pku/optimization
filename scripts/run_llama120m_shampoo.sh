@@ -8,10 +8,18 @@ root=${RUN_DIR:-runs/llama120m_shampoo}
 python=${PYTHON:-python}
 config=configs/llama2_120m.json
 world=${WORLD_SIZE_TRAIN:-2}
+validation_every=${VALIDATION_EVERY:-3000}
 mkdir -p "$root"
 
 if [[ "$mode" != analyze ]]; then
-  tokenizer=${TOKENIZER:?set TOKENIZER to the tokenizer file used to prepare the dataset}
+  if [[ -n "${TOKENIZER:-}" && -z "${PRETOKENIZED_PROVENANCE:-}" ]]; then
+    input_source=(--tokenizer "$TOKENIZER")
+  elif [[ -z "${TOKENIZER:-}" && -n "${PRETOKENIZED_PROVENANCE:-}" ]]; then
+    input_source=(--pretokenized-provenance "$PRETOKENIZED_PROVENANCE")
+  else
+    printf '%s\n' 'Set exactly one of TOKENIZER or PRETOKENIZED_PROVENANCE.' >&2
+    exit 2
+  fi
   if [[ ! -f "$root/init.pt" ]]; then
     "$python" -m ougd.shampoo_plan init --config "$config" --output "$root/init.pt"
   fi
@@ -19,6 +27,7 @@ fi
 
 train() {
   local scheme=$1 peak=$2 minimum=$3 steps=$4 directory=$5
+  printf 'Training %s with peak LR %s and target %s updates in %s\n' "$scheme" "$peak" "$steps" "$directory"
   local resume=()
   if [[ -f "$directory/latest.pt" ]]; then
     resume=(--resume "$directory/latest.pt")
@@ -28,7 +37,8 @@ train() {
   "$python" -m torch.distributed.run --standalone --nproc-per-node "$world" -m ougd.train \
     --config "$config" --optimizer shampoo --shampoo-partition "$scheme" \
     --initial-state "$root/init.pt" --data "$data_dir/train.npy" \
-    --validation-data "$data_dir/validation.npy" --tokenizer "$tokenizer" --fp1 "$data_dir/FP1.pt" \
+    --validation-data "$data_dir/validation.npy" --validation-every "$validation_every" \
+    "${input_source[@]}" --fp1 "$data_dir/FP1.pt" \
     --output "$directory" --steps "$steps" --measure-steps 0,300,3000,6000,9000,12208 \
     --batch-tokens 8192 --microbatch 4 --lr "$peak" --min-lr "$minimum" "${resume[@]}"
 }
@@ -56,6 +66,7 @@ if [[ "$mode" == analyze || "$mode" == all ]]; then
   analyze() {
     local directory=$1 step=$2 variant=$3 window=$4 ridge=$5
     shift 5
+    printf 'Analyzing %s at step %s, variant %s\n' "$directory" "$step" "$variant"
     "$python" -m ougd.shampoo_measure --checkpoint "$directory/checkpoint_$step.pt" \
       --data "$data_dir/train.npy" --fp1 "$data_dir/FP1.pt" \
       --output "$directory/analysis/$step/$variant" --hessian-cache "$directory/hessian_cache" \

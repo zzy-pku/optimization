@@ -19,7 +19,7 @@ The pilot runs each shared peak LR candidate for 400 updates. Its operational st
 
 The training manifest records calibration indices and hashes, the data, tokenizer and FP1 hashes, and the partition. The pilot and full runs log training and validation cross-entropy, gradient and update norms, optimizer time, throughput, and peak CUDA allocation. The periodic `latest.pt` and numbered checkpoints are both valid resume inputs.
 
-For a direct `ougd.train` smoke test with legacy pretokenized arrays, `--pretokenized-provenance` accepts a JSON manifest with `data_sha256` and `source`. The trainer validates the hash and records the manifest alongside a null tokenizer hash.
+For legacy pretokenized arrays, set `PRETOKENIZED_PROVENANCE` instead of `TOKENIZER`. The JSON manifest must include `data_sha256` and `source`. The trainer validates the hash and records the manifest alongside a null tokenizer hash. The launcher uses the previous 120M experiment's validation interval of 3000 steps. Set `VALIDATION_EVERY` to change the interval.
 
 ## Analyze one checkpoint
 
