@@ -5,7 +5,8 @@ from scipy.sparse.linalg import LinearOperator, eigsh, ArpackNoConvergence, Arpa
 
 
 def positive_spectrum(mv, n, requested, seed, solver_tol=1e-6, residual_tol=1e-4,
-                      maxiter=500, ncv=None, progress=None, progress_every=50):
+                      maxiter=500, ncv=None, progress=None, progress_every=50,
+                      residual_scale='sum'):
     """LA only. Preserve all returned eigenpairs, with numerical sign and convergence flags."""
     if not 0 < requested < n:
         raise ValueError('require 0 < requested < operator dimension')
@@ -37,7 +38,11 @@ def positive_spectrum(mv, n, requested, seed, solver_tol=1e-6, residual_tol=1e-4
         vectors /= np.linalg.norm(vectors, axis=0, keepdims=True)
         applied = np.column_stack([counted(v) for v in vectors.T])
         absolute = np.linalg.norm(applied - vectors * values, axis=0)
-        relative = absolute / (np.linalg.norm(applied, axis=0) + np.abs(values) + 1e-30)
+        action_norm = np.linalg.norm(applied, axis=0)
+        if residual_scale == 'max':
+            relative = absolute / np.maximum(1e-12, np.maximum(action_norm, np.abs(values)))
+        else:
+            relative = absolute / (action_norm + np.abs(values) + 1e-30)
     else:
         absolute = relative = np.empty(0)
     passed = relative <= residual_tol

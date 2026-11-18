@@ -4,7 +4,7 @@ from scipy.sparse.linalg import LinearOperator
 
 
 def large_positive_spectrum(mv, n, requested, seed, solver_tol=1e-6, residual_tol=1e-4,
-                            maxiter=1000, progress=None):
+                            maxiter=1000, progress=None, residual_scale='sum'):
     import primme
     calls = 0
     def matvec(x):
@@ -21,7 +21,10 @@ def large_positive_spectrum(mv, n, requested, seed, solver_tol=1e-6, residual_to
     absolute, relative = [], []
     for i, value in enumerate(vals):
         action = matvec(vecs[:,i]); error = np.linalg.norm(action-value*vecs[:,i])
-        absolute.append(float(error)); relative.append(float(error/(np.linalg.norm(action)+abs(value)+1e-30)))
+        action_norm = np.linalg.norm(action)
+        scale = (max(action_norm, abs(value), 1e-12) if residual_scale == 'max'
+                 else action_norm + abs(value) + 1e-30)
+        absolute.append(float(error)); relative.append(float(error/scale))
     absolute = np.asarray(absolute); relative = np.asarray(relative); passed = relative <= residual_tol
     return dict(values=vals, vectors=vecs, absolute_residual=absolute, relative_residual=relative,
         residual_passed=passed, numerically_positive=(vals>absolute)&passed,

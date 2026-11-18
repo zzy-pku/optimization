@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 import json
 import math
+import os
 from pathlib import Path
 import random
 import time
@@ -14,11 +15,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from . import distributed as dd
 from .data import TokenData, sha256, make_batches
 from .model import ModelConfig, Transformer, ce_sum
+from .shampoo import Partition, Shampoo
 
 
 def optimizer_settings(args):
     settings = {'optimizer': args.optimizer, 'weight_decay': args.weight_decay}
-    if args.optimizer in ('adamw', 'adam', 'soap', 'muon'):
+    if args.optimizer in ('adamw', 'adam', 'soap', 'muon', 'shampoo'):
         settings.update(beta1=args.beta1, beta2=args.beta2, eps=args.eps)
     if args.optimizer == 'sgd':
         settings.update(momentum=args.momentum, nesterov=args.nesterov)
@@ -29,6 +31,9 @@ def optimizer_settings(args):
     if args.optimizer == 'soap':
         settings.update(soap_precondition_frequency=args.soap_precondition_frequency,
                         soap_max_precond_dim=args.soap_max_precond_dim)
+    if args.optimizer == 'shampoo':
+        settings.update(shampoo_partition=args.shampoo_partition, ridge=args.ridge,
+                        root_refresh=args.root_refresh)
     return settings
 
 
@@ -55,6 +60,14 @@ class PairedOptimizer:
 
 def make_optimizer(model, args):
     parameters = model.parameters()
+    if args.optimizer == 'shampoo':
+        partition = Partition(model)
+        other = [p for name, p in model.named_parameters() if name not in partition.parameters]
+        primary = Shampoo(partition, args.shampoo_partition, args.lr, (args.beta1, args.beta2),
+                          args.ridge, args.weight_decay, args.root_refresh)
+        auxiliary = torch.optim.AdamW(other, lr=args.lr, betas=(args.beta1, args.beta2),
+                                      eps=args.eps, weight_decay=args.weight_decay)
+        return PairedOptimizer(primary, auxiliary)
     if args.optimizer in ('muon', 'soap'):
         named = list(model.named_parameters())
         matrices = [p for name, p in named if name.startswith('blocks.') and p.ndim == 2]
@@ -87,6 +100,7 @@ def cpu_tree(value):
     if isinstance(value, torch.Tensor): return value.detach().cpu().clone()
     if isinstance(value, dict): return {k: cpu_tree(v) for k,v in value.items()}
     if isinstance(value, list): return [cpu_tree(v) for v in value]
+    if isinstance(value, tuple): return tuple(cpu_tree(v) for v in value)
     return copy.deepcopy(value)
 
 def main():
@@ -103,7 +117,15 @@ def main():
     p.add_argument('--measure-blocks', choices=['four', 'seven'], default='four',
                    help='which block gradients and updates to save in pre-step checkpoints')
     p.add_argument('--lr', type=float, default=4e-4)
-    p.add_argument('--optimizer', choices=['adamw', 'adam', 'sgd', 'muon', 'soap'], default='adamw')
+    p.add_argument('--optimizer', choices=['adamw', 'adam', 'sgd', 'muon', 'soap', 'shampoo'], default='adamw')
+    p.add_argument('--shampoo-partition', choices=['M', 'U'])
+    p.add_argument('--ridge', type=float, default=1e-6)
+    p.add_argument('--root-refresh', type=int, default=10)
+    p.add_argument('--initial-state', help='shared initial model state_dict for Shampoo training')
+    p.add_argument('--tokenizer', help='tokenizer file whose SHA256 is recorded')
+    p.add_argument('--fp1', help='fixed Hessian validation batch whose SHA256 is recorded')
+    p.add_argument('--calibration-seed', type=int, default=19)
+    p.add_argument('--calibration-windows', type=int, default=16)
     p.add_argument('--weight-decay', type=float, default=.1)
     p.add_argument('--beta1', type=float, default=.9)
     p.add_argument('--beta2', type=float, default=.95)
@@ -122,13 +144,18 @@ def main():
     p.add_argument('--save-every', type=int, default=250, help='post-update recovery checkpoint interval')
     p.add_argument('--resume')
     args = p.parse_args()
+    shampoo = args.optimizer == 'shampoo'
+    if shampoo and (not all((args.shampoo_partition, args.initial_state, args.tokenizer, args.fp1))
+                    or not math.isfinite(args.ridge) or args.ridge <= 0 or args.root_refresh < 1
+                    or args.calibration_windows < 1):
+        p.error('Shampoo requires partition, initial state, tokenizer, FP1 and valid calibration settings')
     if args.nesterov and (args.optimizer != 'sgd' or args.momentum <= 0):
         p.error('--nesterov requires SGD and positive momentum')
     if (args.weight_decay < 0 or args.eps <= 0 or not (0 <= args.beta1 < 1 and 0 <= args.beta2 < 1)
             or args.momentum < 0 or not 0 <= args.muon_momentum < 1 or args.lr <= 0 or args.aux_lr <= 0
             or args.soap_precondition_frequency < 1 or args.soap_max_precond_dim < 1):
         p.error('invalid optimizer hyperparameters')
-    if args.precision == 'fp32':
+    if args.precision == 'fp32' or shampoo:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.set_float32_matmul_precision('highest')
@@ -146,7 +173,25 @@ def main():
     data = TokenData(args.data, c.context, c.vocab_size)
     data_hash = sha256(args.data)
     model = Transformer(c).to(device)
+    if shampoo:
+        model.load_state_dict(torch.load(args.initial_state, map_location='cpu', weights_only=True))
     optimizer = make_optimizer(model, args)
+    if shampoo:
+        from .seven_measure import batch_hash
+        generator = np.random.default_rng(args.calibration_seed)
+        count = sequences * args.calibration_windows
+        if count > len(data.tokens):
+            raise ValueError('not enough distinct training rows for calibration')
+        chosen = generator.choice(len(data.tokens), count, replace=False).reshape(-1, sequences)
+        calibration = [dict(indices=indices.tolist(), token_hash=batch_hash(data.batch(indices, 'cpu')))
+                       for indices in chosen]
+        provenance = dict(initialization_hash=sha256(args.initial_state), tokenizer_hash=sha256(args.tokenizer),
+                          fp1_hash=sha256(args.fp1), partition=optimizer.primary.partition.manifest,
+                          partition_hash=optimizer.primary.partition.hash, calibration=calibration,
+                          rmsnorm_epsilon=1e-6, roots='torch.linalg.eigh float64; factors and cache float32',
+                          hardware=torch.cuda.get_device_name(device) if device.type == 'cuda' else 'CPU',
+                          software=dict(torch=str(torch.__version__), cuda=torch.version.cuda),
+                          world_size=world)
     start = 0
     if args.resume:
         state = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -163,26 +208,83 @@ def main():
         model.load_state_dict(state['model'])
         optimizer.load_state_dict(state['optimizer'])
         start = state['step']
-        torch.set_rng_state(state['rng'])
-        if device.type == 'cuda' and state.get('cuda_rng') is not None:
-            torch.cuda.set_rng_state(state['cuda_rng'], device)
+        if shampoo:
+            for key in ('steps', 'warmup', 'lr', 'min_lr', 'seed', 'precision', 'microbatch'):
+                if old[key] != getattr(args, key):
+                    raise ValueError(f'resume must preserve {key}')
+            resume_keys = ('initialization_hash', 'tokenizer_hash', 'fp1_hash', 'partition_hash',
+                           'calibration', 'roots', 'world_size')
+            if (any(state['provenance'][key] != provenance[key] for key in resume_keys)
+                    or state['data_cursor'] != start * sequences):
+                raise ValueError('resume Shampoo provenance or data cursor mismatch')
+            rng = state['rank_rng'][rank]
+            np.random.set_state(rng['numpy'])
+            random.setstate(rng['python'])
+        else:
+            rng = state
+        torch.set_rng_state(rng['rng'])
+        if device.type == 'cuda' and rng.get('cuda_rng') is not None:
+            torch.cuda.set_rng_state(rng['cuda_rng'], device)
+        del state
     wrapped = DDP(model, device_ids=[device.index] if device.type == 'cuda' else None) if world > 1 else model
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     selected = model.selected_seven(args.layer) if args.measure_blocks == 'seven' else model.selected(args.layer)
+    if shampoo:
+        names = {id(p): name for name, p in optimizer.primary.partition.parameters.items()}
+        selected = {names[id(p)]: p for p in selected.values()}
     measure_steps = {int(x) for x in args.measure_steps.split(',') if x}
     def cpu_state():
         return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     def checkpoint(step):
         return dict(config=asdict(c), model=cpu_state(), optimizer=optimizer.state_dict(),
                     step=step, rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state(device) if device.type == 'cuda' else None, args=vars(args), data_hash=data_hash)
+    def shampoo_checkpoint(step):
+        local_rng = dict(rng=torch.get_rng_state(), numpy=np.random.get_state(),
+                         python=random.getstate(),
+                         cuda_rng=torch.cuda.get_rng_state(device) if device.type == 'cuda' else None)
+        if world > 1:
+            rng_by_rank = [None] * world
+            torch.distributed.all_gather_object(rng_by_rank, local_rng)
+        else:
+            rng_by_rank = [local_rng]
+        if rank == 0:
+            state = checkpoint(step)
+            state.update(optimizer=cpu_tree(state['optimizer']), rank_rng=rng_by_rank,
+                         data_cursor=step * sequences, completed_steps=step,
+                         origin=f'train-{args.shampoo_partition}', provenance=provenance,
+                         scheduler=dict(completed_steps=step, warmup=args.warmup, steps=args.steps,
+                                        peak_lr=args.lr, min_lr=args.min_lr))
+            if step in measure_steps or step == args.steps:
+                destination = output / f'checkpoint_{step:06d}.pt'
+                atomic_save(state, destination)
+                if step and (step % args.save_every == 0 or step == args.steps):
+                    latest = output / 'latest.pt'
+                    link = output / 'latest.link'
+                    link.unlink(missing_ok=True)
+                    try:
+                        os.link(destination, link)
+                        link.replace(latest)
+                    except OSError:
+                        atomic_save(state, latest)
+            elif step % args.save_every == 0:
+                atomic_save(state, output / 'latest.pt')
     if rank == 0:
         (output / 'run.json').write_text(json.dumps(dict(args=vars(args), model=asdict(c),
             parameters=sum(p.numel() for p in model.parameters()), world_size=world,
             data_hash=data_hash, torch=torch.__version__,
             optimizer_parameter_groups=({'primary': [n for n,p in model.named_parameters() if n.startswith('blocks.') and p.ndim == 2],
               'adamw_auxiliary': [n for n,p in model.named_parameters() if not (n.startswith('blocks.') and p.ndim == 2)]}
-              if args.optimizer in ('muon', 'soap') else {'all': [n for n,p in model.named_parameters()]})), indent=2))
+              if args.optimizer in ('muon', 'soap', 'shampoo') else {'all': [n for n,p in model.named_parameters()]}),
+            **({'shampoo': provenance} if shampoo else {})), indent=2))
+    if shampoo and start == 0:
+        shampoo_checkpoint(0)
+    if shampoo and args.resume and rank == 0 and (output / 't0.jsonl').exists():
+        log = output / 't0.jsonl'
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        suffix = log.with_suffix('.tmp')
+        suffix.write_text(''.join(json.dumps(row)+'\n' for row in rows if row['completed_steps'] <= start))
+        suffix.replace(log)
     for step in range(start, args.steps):
         begin = time.perf_counter()
         indices = [(step * sequences + j) % len(data.tokens) for j in range(sequences)]
@@ -194,8 +296,9 @@ def main():
         lr = args.lr * (step + 1) / args.warmup if step < args.warmup else args.min_lr + .5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * (step-args.warmup) / max(1, args.steps-args.warmup-1)))
         for g in optimizer.param_groups:
             g['lr'] = lr * g.get('lr_scale', 1.)
-        measured = step in measure_steps or step == args.steps-1
-        before = {k: v.detach().clone() for k, v in selected.items()}
+        measured = not shampoo and (step in measure_steps or step == args.steps-1)
+        observed = (optimizer.primary.partition.parameters if shampoo else selected)
+        before = {k: v.detach().clone() for k, v in observed.items()}
         pre = checkpoint(step) if measured and rank == 0 else None
         if pre is not None:
             pre['optimizer'] = cpu_tree(pre['optimizer'])
@@ -209,8 +312,14 @@ def main():
                 loss_sum += loss.detach().float()
                 (loss * (world / count)).backward()
         raw = {k: v.grad.detach().cpu().clone() for k, v in selected.items()}
-        gradnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+        gradnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=shampoo)
+        if shampoo and device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        optim_start = time.perf_counter()
         optimizer.step()
+        if shampoo and device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        optim_seconds = time.perf_counter()-optim_start
         updates = {k: v.detach() - before[k] for k, v in selected.items()}
         if measured and rank == 0:
             pre.update(pre_update_state=True, layer=args.layer,
@@ -226,6 +335,18 @@ def main():
             tokens_per_second=int(count) / (time.perf_counter()-begin),
             blocks={k: dict(parameter_norm=float(v.detach().norm()), gradient_norm=float(raw[k].norm()),
                             update_norm=float(updates[k].norm())) for k, v in selected.items()})
+        if shampoo:
+            update2 = torch.stack([(v.detach()-before[k]).norm().square() for k, v in observed.items()]).sum()
+            param2 = torch.stack([v.norm().square() for v in before.values()]).sum()
+            metrics.update(completed_steps=step+1, update_parameter_ratio=float((update2/param2).sqrt()),
+                           root_last_refresh_step=optimizer.primary.root_last_refresh_step,
+                           root_accuracy=max(max(x) for x in optimizer.primary.root_accuracy.values()),
+                           optimizer_seconds=optim_seconds,
+                           cuda_peak_allocated_bytes=(torch.cuda.max_memory_allocated(device)
+                                                      if device.type == 'cuda' else None))
+            if not all(math.isfinite(metrics[k]) for k in ('train_ce', 'update_parameter_ratio', 'root_accuracy')):
+                raise FloatingPointError('nonfinite Shampoo loss, update or root error')
+            del before
         if args.optimizer in ('muon', 'soap'):
             metrics['aux_lr'] = optimizer.auxiliary.param_groups[0]['lr']
         if args.validation_data and (step % args.validation_every == 0 or step == args.steps-1):
@@ -244,10 +365,18 @@ def main():
             with (output / 't0.jsonl').open('a') as f:
                 f.write(json.dumps(metrics) + '\n')
             print(json.dumps(metrics), flush=True)
-            if (step+1) % args.save_every == 0 or step == args.steps-1:
+            if not shampoo and ((step+1) % args.save_every == 0 or step == args.steps-1):
                 torch.save(checkpoint(step+1), output / 'latest.pt.tmp')
                 (output / 'latest.pt.tmp').replace(output / 'latest.pt')
+        if shampoo and ((step+1) in measure_steps or (step+1) % args.save_every == 0 or step+1 == args.steps):
+            shampoo_checkpoint(step+1)
     dd.close()
+
+
+def atomic_save(state, path):
+    temporary = path.with_suffix('.tmp')
+    torch.save(state, temporary)
+    temporary.replace(path)
 
 if __name__ == '__main__':
     main()
