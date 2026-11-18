@@ -122,7 +122,10 @@ def main():
     p.add_argument('--ridge', type=float, default=1e-6)
     p.add_argument('--root-refresh', type=int, default=10)
     p.add_argument('--initial-state', help='shared initial model state_dict for Shampoo training')
-    p.add_argument('--tokenizer', help='tokenizer file whose SHA256 is recorded')
+    input_source = p.add_mutually_exclusive_group()
+    input_source.add_argument('--tokenizer', help='tokenizer file whose SHA256 is recorded')
+    input_source.add_argument('--pretokenized-provenance',
+                              help='JSON with data_sha256 and source for pretokenized data without a tokenizer file')
     p.add_argument('--fp1', help='fixed Hessian validation batch whose SHA256 is recorded')
     p.add_argument('--calibration-seed', type=int, default=19)
     p.add_argument('--calibration-windows', type=int, default=16)
@@ -145,10 +148,11 @@ def main():
     p.add_argument('--resume')
     args = p.parse_args()
     shampoo = args.optimizer == 'shampoo'
-    if shampoo and (not all((args.shampoo_partition, args.initial_state, args.tokenizer, args.fp1))
+    if shampoo and (not all((args.shampoo_partition, args.initial_state,
+                             args.tokenizer or args.pretokenized_provenance, args.fp1))
                     or not math.isfinite(args.ridge) or args.ridge <= 0 or args.root_refresh < 1
                     or args.calibration_windows < 1):
-        p.error('Shampoo requires partition, initial state, tokenizer, FP1 and valid calibration settings')
+        p.error('Shampoo requires partition, initial state, data provenance, FP1 and valid calibration settings')
     if args.nesterov and (args.optimizer != 'sgd' or args.momentum <= 0):
         p.error('--nesterov requires SGD and positive momentum')
     if (args.weight_decay < 0 or args.eps <= 0 or not (0 <= args.beta1 < 1 and 0 <= args.beta2 < 1)
@@ -178,6 +182,12 @@ def main():
     optimizer = make_optimizer(model, args)
     if shampoo:
         from .seven_measure import batch_hash
+        pretokenized = None
+        if args.pretokenized_provenance:
+            source = json.loads(Path(args.pretokenized_provenance).read_text(encoding='utf-8'))
+            if source.get('data_sha256') != data_hash or not source.get('source'):
+                raise ValueError('pretokenized provenance must match the training hash and name its source')
+            pretokenized = dict(manifest_hash=sha256(args.pretokenized_provenance), source=source['source'])
         generator = np.random.default_rng(args.calibration_seed)
         count = sequences * args.calibration_windows
         if count > len(data.tokens):
@@ -185,7 +195,9 @@ def main():
         chosen = generator.choice(len(data.tokens), count, replace=False).reshape(-1, sequences)
         calibration = [dict(indices=indices.tolist(), token_hash=batch_hash(data.batch(indices, 'cpu')))
                        for indices in chosen]
-        provenance = dict(initialization_hash=sha256(args.initial_state), tokenizer_hash=sha256(args.tokenizer),
+        provenance = dict(initialization_hash=sha256(args.initial_state),
+                          tokenizer_hash=sha256(args.tokenizer) if args.tokenizer else None,
+                          pretokenized=pretokenized,
                           fp1_hash=sha256(args.fp1), partition=optimizer.primary.partition.manifest,
                           partition_hash=optimizer.primary.partition.hash, calibration=calibration,
                           rmsnorm_epsilon=1e-6, roots='torch.linalg.eigh float64; factors and cache float32',
@@ -212,9 +224,9 @@ def main():
             for key in ('steps', 'warmup', 'lr', 'min_lr', 'seed', 'precision', 'microbatch'):
                 if old[key] != getattr(args, key):
                     raise ValueError(f'resume must preserve {key}')
-            resume_keys = ('initialization_hash', 'tokenizer_hash', 'fp1_hash', 'partition_hash',
+            resume_keys = ('initialization_hash', 'tokenizer_hash', 'pretokenized', 'fp1_hash', 'partition_hash',
                            'calibration', 'roots', 'world_size')
-            if (any(state['provenance'][key] != provenance[key] for key in resume_keys)
+            if (any(state['provenance'].get(key) != provenance[key] for key in resume_keys)
                     or state['data_cursor'] != start * sequences):
                 raise ValueError('resume Shampoo provenance or data cursor mismatch')
             rng = state['rank_rng'][rank]
